@@ -1,0 +1,11 @@
+bin/
+obj/
+.vs/
+logs/
+llm-cache/
+node_modules/
+data/
+*.log
+*.user
+*.suo
+.claude/

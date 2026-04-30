@@ -1,0 +1,9 @@
+bin/
+obj/
+.vs/
+logs/
+llm-cache/
+node_modules/
+*.log
+*.user
+*.suo

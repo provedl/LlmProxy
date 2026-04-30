@@ -1,0 +1,11 @@
+{
+  "name": "llm-proxy-kiro-helper",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Node helper for Kiro token-backed proxy",
+  "type": "commonjs",
+  "dependencies": {
+    "@aws/codewhisperer-streaming-client": "^1.0.37",
+    "@aws-sdk/client-sso-oidc": "^3.918.0"
+  }
+}
