@@ -565,9 +565,46 @@ MapClaudeProxyRoute("/claude/v1/messages", "Explicit route for Claude CLI style 
 MapClaudeProxyRoute("/hermes/v1/messages", "Explicit route for Hermes integrations.");
 MapClaudeProxyRoute("/custom/v1/messages", "Explicit route for custom applications.");
 
+// OpenAI Responses API 兼容端点 —— 支持 Codex CLI
+MapResponsesApiRoute("/v1/responses", "OpenAI Responses API compatible endpoint for Codex CLI and other OpenAI-compatible clients.");
+
 var port = config.GetValue("Proxy:ListenPort", 3000);
 app.Urls.Add($"http://0.0.0.0:{port}");
 Log.Information("LLM Proxy 监听端口: {Port}", port);
+
+// 后台定时刷新 Kiro token，防止长时间无请求导致 token 过期掉线
+if (backend.Equals("KiroApi", StringComparison.OrdinalIgnoreCase))
+{
+    var refreshIntervalMinutes = config.GetValue("Proxy:KiroApi:TokenRefreshIntervalMinutes", 45);
+    _ = Task.Run(async () =>
+    {
+        var timer = new PeriodicTimer(TimeSpan.FromMinutes(refreshIntervalMinutes));
+        Log.Information("Kiro token 后台刷新已启动，间隔: {Interval} 分钟", refreshIntervalMinutes);
+        while (await timer.WaitForNextTickAsync())
+        {
+            try
+            {
+                var refreshResult = await RefreshKiroTokenAsync(
+                    kiroNodeCommand, kiroHelperPath, kiroRegion, kiroEndpoint,
+                    kiroTokenFilePath, kiroRegistrationCacheDirectory,
+                    kiroContentCollectionEnabled, kiroAgentMode);
+                if (refreshResult.Success)
+                {
+                    Log.Information("Kiro token 后台刷新成功，新过期时间: {ExpiresAt}", refreshResult.ExpiresAt);
+                }
+                else
+                {
+                    Log.Warning("Kiro token 后台刷新失败: {Error}", refreshResult.Error);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Kiro token 后台刷新异常");
+            }
+        }
+    });
+}
+
 app.Run();
 
 void MapClaudeProxyRoute(string pattern, string description)
@@ -676,6 +713,709 @@ Example response:
 }
 """)
         .Produces<ModelsResponse>(StatusCodes.Status200OK, "application/json");
+}
+
+void MapResponsesApiRoute(string pattern, string description)
+{
+    app.MapPost(pattern, async (HttpContext ctx, CancellationToken _) =>
+            await HandleResponsesApiAsync(ctx))
+        .WithName($"ResponsesApi_{SanitizeEndpointName(pattern)}")
+        .WithTags("Codex")
+        .WithSummary("OpenAI Responses API compatible endpoint")
+        .WithDescription(description)
+        .Produces(StatusCodes.Status200OK)
+        .Produces(StatusCodes.Status400BadRequest)
+        .Produces(StatusCodes.Status502BadGateway);
+}
+
+async Task HandleResponsesApiAsync(HttpContext ctx)
+{
+    var logger = ctx.RequestServices.GetRequiredService<Microsoft.Extensions.Logging.ILogger<Program>>();
+    var clientFactory = ctx.RequestServices.GetRequiredService<IHttpClientFactory>();
+
+    using var reader = new StreamReader(ctx.Request.Body);
+    var requestBody = await reader.ReadToEndAsync();
+
+    logger.LogInformation("收到 Responses API 请求, 大小: {Size} bytes", requestBody.Length);
+
+    // Codex CLI 可能发送空 body 的探测请求
+    if (string.IsNullOrWhiteSpace(requestBody))
+    {
+        logger.LogInformation("Responses API 收到空 body 请求，返回空响应");
+        ctx.Response.StatusCode = 200;
+        await ctx.Response.WriteAsJsonAsync(new
+        {
+            id = $"resp_{Guid.NewGuid():N}",
+            @object = "response",
+            status = "completed",
+            output = Array.Empty<object>(),
+            model = defaultModel,
+            usage = new { input_tokens = 0, output_tokens = 0, total_tokens = 0 }
+        });
+        return;
+    }
+
+    JsonDocument requestDoc;
+    try
+    {
+        requestDoc = JsonDocument.Parse(requestBody);
+    }
+    catch (JsonException ex)
+    {
+        logger.LogWarning(ex, "Responses API 请求 JSON 解析失败");
+        ctx.Response.StatusCode = 400;
+        await ctx.Response.WriteAsJsonAsync(new { error = new { message = "Invalid JSON request body", type = "invalid_request_error" } });
+        return;
+    }
+
+    using (requestDoc)
+    {
+        var root = requestDoc.RootElement;
+
+        // 解析请求参数
+        var model = root.TryGetProperty("model", out var modelEl) ? modelEl.GetString() ?? defaultModel : defaultModel;
+        var wantsStream = root.TryGetProperty("stream", out var streamEl) && streamEl.ValueKind == JsonValueKind.True;
+        var instructions = root.TryGetProperty("instructions", out var instrEl) ? instrEl.GetString() : null;
+        var maxTokens = root.TryGetProperty("max_output_tokens", out var maxTokEl) && maxTokEl.ValueKind == JsonValueKind.Number
+            ? maxTokEl.GetInt32()
+            : 16384;
+
+        // 转换 input → Anthropic messages
+        var messages = ConvertResponsesInputToMessages(root, logger);
+
+        // 转换 tools
+        var tools = ConvertResponsesToolsToAnthropic(root);
+
+        // 构造 Anthropic Messages API 请求
+        var anthropicRequest = new Dictionary<string, object?>
+        {
+            ["model"] = model,
+            ["max_tokens"] = maxTokens,
+            ["stream"] = false,
+            ["messages"] = messages
+        };
+        if (!string.IsNullOrEmpty(instructions))
+        {
+            anthropicRequest["system"] = instructions;
+        }
+        if (tools != null && tools.Count > 0)
+        {
+            anthropicRequest["tools"] = tools;
+        }
+
+        var anthropicRequestJson = JsonSerializer.Serialize(anthropicRequest);
+        logger.LogInformation("Responses API → Anthropic Messages 转换完成, model={Model}, messages={Count}", model, messages.Count);
+
+        // 调用后端
+        ProxyResult result = backend.Equals("KiroApi", StringComparison.OrdinalIgnoreCase)
+            ? await ForwardToKiroApiAsync(
+                anthropicRequestJson,
+                kiroNodeCommand,
+                kiroHelperPath,
+                kiroRegion,
+                kiroEndpoint,
+                kiroTokenFilePath,
+                kiroRegistrationCacheDirectory,
+                kiroContentCollectionEnabled,
+                kiroAgentMode,
+                logger,
+                ctx.RequestAborted)
+            : await ForwardToAnthropicAsync(
+                ctx,
+                anthropicRequestJson,
+                upstreamBaseUrl,
+                upstreamApiKey,
+                maxRetries,
+                clientFactory,
+                logger,
+                ctx.RequestAborted);
+
+        if (result.StatusCode is >= 200 and < 300)
+        {
+            RecordUsage(usageConnectionString, result.Body, model, backend, ctx.Request.Path, logger);
+        }
+
+        if (result.StatusCode is not (>= 200 and < 300))
+        {
+            // 错误响应
+            ctx.Response.StatusCode = result.StatusCode;
+            ctx.Response.ContentType = "application/json";
+            await ctx.Response.WriteAsJsonAsync(new
+            {
+                error = new { message = $"Upstream error: {result.Body}", type = "api_error", code = result.StatusCode }
+            });
+            return;
+        }
+
+        // 将 Anthropic 响应转换为 Responses API 格式
+        if (wantsStream)
+        {
+            await WriteResponsesApiStreaming(ctx, result.Body, model, logger);
+        }
+        else
+        {
+            var responsesApiResponse = ConvertAnthropicToResponsesApi(result.Body, model, logger);
+            ctx.Response.ContentType = "application/json";
+            await ctx.Response.WriteAsync(responsesApiResponse);
+        }
+    }
+}
+
+/// <summary>
+/// 将 Responses API 的 input 字段转换为 Anthropic Messages 格式
+/// </summary>
+static List<Dictionary<string, object?>> ConvertResponsesInputToMessages(JsonElement root, Microsoft.Extensions.Logging.ILogger logger)
+{
+    var messages = new List<Dictionary<string, object?>>();
+
+    if (!root.TryGetProperty("input", out var inputEl))
+    {
+        return messages;
+    }
+
+    // input 可以是字符串或数组
+    if (inputEl.ValueKind == JsonValueKind.String)
+    {
+        messages.Add(new Dictionary<string, object?>
+        {
+            ["role"] = "user",
+            ["content"] = inputEl.GetString()
+        });
+        return messages;
+    }
+
+    if (inputEl.ValueKind != JsonValueKind.Array)
+    {
+        return messages;
+    }
+
+    foreach (var item in inputEl.EnumerateArray())
+    {
+        var type = item.TryGetProperty("type", out var typeEl) ? typeEl.GetString() : null;
+        var role = item.TryGetProperty("role", out var roleEl) ? roleEl.GetString() : null;
+
+        // 处理 message 类型（有 role 的项）
+        if (role != null || type == "message")
+        {
+            var effectiveRole = role ?? "user";
+            // developer/system role → 跳过（已通过 instructions 处理），或映射为 user
+            if (effectiveRole == "developer" || effectiveRole == "system")
+            {
+                // 作为 user 消息附加（instructions 更优先，但有些客户端会在 input 里放 system）
+                effectiveRole = "user";
+            }
+
+            var content = item.TryGetProperty("content", out var contentEl) ? contentEl : default;
+            string? textContent = null;
+
+            if (content.ValueKind == JsonValueKind.String)
+            {
+                textContent = content.GetString();
+            }
+            else if (content.ValueKind == JsonValueKind.Array)
+            {
+                // 提取 text 类型的内容
+                var parts = new List<string>();
+                foreach (var part in content.EnumerateArray())
+                {
+                    var partType = part.TryGetProperty("type", out var ptEl) ? ptEl.GetString() : null;
+                    if (partType is "input_text" or "text" or "output_text")
+                    {
+                        var text = part.TryGetProperty("text", out var txtEl) ? txtEl.GetString() : null;
+                        if (text != null) parts.Add(text);
+                    }
+                }
+                textContent = string.Join("\n", parts);
+            }
+
+            if (!string.IsNullOrEmpty(textContent))
+            {
+                messages.Add(new Dictionary<string, object?>
+                {
+                    ["role"] = effectiveRole == "assistant" ? "assistant" : "user",
+                    ["content"] = textContent
+                });
+            }
+        }
+        // 处理 function_call 类型 → 映射为 assistant 的 tool_use
+        else if (type == "function_call")
+        {
+            var callId = item.TryGetProperty("call_id", out var cidEl) ? cidEl.GetString() ?? "" : "";
+            var name = item.TryGetProperty("name", out var nameEl) ? nameEl.GetString() ?? "" : "";
+            var arguments = item.TryGetProperty("arguments", out var argsEl) ? argsEl.GetString() ?? "{}" : "{}";
+
+            object? parsedInput;
+            try
+            {
+                parsedInput = JsonSerializer.Deserialize<object>(arguments);
+            }
+            catch
+            {
+                parsedInput = new { };
+            }
+
+            // 将 function_call 合并到上一个 assistant 消息中，或创建新的
+            var toolUseBlock = new Dictionary<string, object?>
+            {
+                ["type"] = "tool_use",
+                ["id"] = callId,
+                ["name"] = name,
+                ["input"] = parsedInput
+            };
+
+            // 查找最后一个 assistant 消息并追加
+            var lastAssistant = messages.LastOrDefault(m => m["role"]?.ToString() == "assistant");
+            if (lastAssistant != null && lastAssistant["content"] is List<object> existingBlocks)
+            {
+                existingBlocks.Add(toolUseBlock);
+            }
+            else
+            {
+                messages.Add(new Dictionary<string, object?>
+                {
+                    ["role"] = "assistant",
+                    ["content"] = new List<object> { toolUseBlock }
+                });
+            }
+        }
+        // 处理 function_call_output 类型 → 映射为 user 的 tool_result
+        else if (type == "function_call_output")
+        {
+            var callId = item.TryGetProperty("call_id", out var cidEl) ? cidEl.GetString() ?? "" : "";
+            var output = item.TryGetProperty("output", out var outEl) ? outEl.GetString() ?? "" : "";
+
+            messages.Add(new Dictionary<string, object?>
+            {
+                ["role"] = "user",
+                ["content"] = new List<object>
+                {
+                    new Dictionary<string, object?>
+                    {
+                        ["type"] = "tool_result",
+                        ["tool_use_id"] = callId,
+                        ["content"] = output
+                    }
+                }
+            });
+        }
+    }
+
+    return messages;
+}
+
+/// <summary>
+/// 将 Responses API 的 tools 转换为 Anthropic 格式
+/// </summary>
+static List<Dictionary<string, object?>>? ConvertResponsesToolsToAnthropic(JsonElement root)
+{
+    if (!root.TryGetProperty("tools", out var toolsEl) || toolsEl.ValueKind != JsonValueKind.Array)
+    {
+        return null;
+    }
+
+    var tools = new List<Dictionary<string, object?>>();
+
+    foreach (var tool in toolsEl.EnumerateArray())
+    {
+        var toolType = tool.TryGetProperty("type", out var ttEl) ? ttEl.GetString() : null;
+        if (toolType != "function") continue; // 只支持 function 类型
+
+        var name = tool.TryGetProperty("name", out var tnEl) ? tnEl.GetString() ?? "" : "";
+        var description = tool.TryGetProperty("description", out var tdEl) ? tdEl.GetString() ?? "" : "";
+        var parameters = tool.TryGetProperty("parameters", out var tpEl)
+            ? JsonSerializer.Deserialize<object>(tpEl.GetRawText())
+            : new { type = "object", properties = new { } };
+
+        tools.Add(new Dictionary<string, object?>
+        {
+            ["name"] = name,
+            ["description"] = description,
+            ["input_schema"] = parameters
+        });
+    }
+
+    return tools.Count > 0 ? tools : null;
+}
+
+/// <summary>
+/// 将 Anthropic Messages 响应转换为 OpenAI Responses API 格式
+/// </summary>
+static string ConvertAnthropicToResponsesApi(string anthropicJson, string model, Microsoft.Extensions.Logging.ILogger logger)
+{
+    try
+    {
+        using var doc = JsonDocument.Parse(anthropicJson);
+        var root = doc.RootElement;
+
+        var responseId = "resp_" + Guid.NewGuid().ToString("N")[..24];
+        var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+        var output = new List<object>();
+
+        if (root.TryGetProperty("content", out var contentEl) && contentEl.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var block in contentEl.EnumerateArray())
+            {
+                var blockType = block.TryGetProperty("type", out var btEl) ? btEl.GetString() : null;
+
+                if (blockType == "text")
+                {
+                    var text = block.TryGetProperty("text", out var txtEl) ? txtEl.GetString() ?? "" : "";
+                    output.Add(new Dictionary<string, object?>
+                    {
+                        ["id"] = "msg_" + Guid.NewGuid().ToString("N")[..24],
+                        ["type"] = "message",
+                        ["status"] = "completed",
+                        ["role"] = "assistant",
+                        ["content"] = new List<object>
+                        {
+                            new Dictionary<string, object?>
+                            {
+                                ["type"] = "output_text",
+                                ["text"] = text,
+                                ["annotations"] = Array.Empty<object>()
+                            }
+                        }
+                    });
+                }
+                else if (blockType == "tool_use")
+                {
+                    var toolId = block.TryGetProperty("id", out var tidEl) ? tidEl.GetString() ?? "" : "";
+                    var toolName = block.TryGetProperty("name", out var tnEl) ? tnEl.GetString() ?? "" : "";
+                    var toolInput = block.TryGetProperty("input", out var tiEl) ? tiEl.GetRawText() : "{}";
+
+                    output.Add(new Dictionary<string, object?>
+                    {
+                        ["id"] = toolId,
+                        ["type"] = "function_call",
+                        ["status"] = "completed",
+                        ["call_id"] = toolId,
+                        ["name"] = toolName,
+                        ["arguments"] = toolInput
+                    });
+                }
+            }
+        }
+
+        // 解析 usage
+        var inputTokens = 0;
+        var outputTokens = 0;
+        if (root.TryGetProperty("usage", out var usageEl))
+        {
+            if (usageEl.TryGetProperty("input_tokens", out var itEl) && itEl.ValueKind == JsonValueKind.Number)
+                inputTokens = itEl.GetInt32();
+            if (usageEl.TryGetProperty("output_tokens", out var otEl) && otEl.ValueKind == JsonValueKind.Number)
+                outputTokens = otEl.GetInt32();
+        }
+
+        var stopReason = root.TryGetProperty("stop_reason", out var srEl) ? srEl.GetString() : "end_turn";
+        var status = stopReason == "tool_use" ? "incomplete" : "completed";
+
+        var response = new Dictionary<string, object?>
+        {
+            ["id"] = responseId,
+            ["object"] = "response",
+            ["created_at"] = created,
+            ["status"] = status,
+            ["model"] = model,
+            ["output"] = output,
+            ["usage"] = new Dictionary<string, object?>
+            {
+                ["input_tokens"] = inputTokens,
+                ["output_tokens"] = outputTokens,
+                ["total_tokens"] = inputTokens + outputTokens
+            }
+        };
+
+        return JsonSerializer.Serialize(response);
+    }
+    catch (Exception ex)
+    {
+        logger.LogWarning(ex, "Anthropic → Responses API 转换失败");
+        return JsonSerializer.Serialize(new
+        {
+            id = "resp_error",
+            @object = "response",
+            created_at = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            status = "failed",
+            model,
+            output = Array.Empty<object>(),
+            error = new { message = ex.Message, type = "server_error" }
+        });
+    }
+}
+
+/// <summary>
+/// 以 OpenAI Responses API SSE 流式格式输出响应
+/// </summary>
+static async Task WriteResponsesApiStreaming(HttpContext ctx, string anthropicJson, string model, Microsoft.Extensions.Logging.ILogger logger)
+{
+    ctx.Response.StatusCode = 200;
+    ctx.Response.ContentType = "text/event-stream";
+    ctx.Response.Headers["Cache-Control"] = "no-cache";
+    ctx.Response.Headers["Connection"] = "keep-alive";
+
+    try
+    {
+        using var doc = JsonDocument.Parse(anthropicJson);
+        var root = doc.RootElement;
+
+        var responseId = "resp_" + Guid.NewGuid().ToString("N")[..24];
+        var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+        // 解析 usage
+        var inputTokens = 0;
+        var outputTokens = 0;
+        if (root.TryGetProperty("usage", out var usageEl))
+        {
+            if (usageEl.TryGetProperty("input_tokens", out var itEl) && itEl.ValueKind == JsonValueKind.Number)
+                inputTokens = itEl.GetInt32();
+            if (usageEl.TryGetProperty("output_tokens", out var otEl) && otEl.ValueKind == JsonValueKind.Number)
+                outputTokens = otEl.GetInt32();
+        }
+
+        var stopReason = root.TryGetProperty("stop_reason", out var srEl) ? srEl.GetString() : "end_turn";
+
+        // 1. response.created
+        var createdEvent = new Dictionary<string, object?>
+        {
+            ["type"] = "response.created",
+            ["response"] = new Dictionary<string, object?>
+            {
+                ["id"] = responseId,
+                ["object"] = "response",
+                ["created_at"] = created,
+                ["status"] = "in_progress",
+                ["model"] = model,
+                ["output"] = Array.Empty<object>()
+            }
+        };
+        await WriteResponsesSseEvent(ctx, createdEvent);
+
+        // 2. response.in_progress
+        await WriteResponsesSseEvent(ctx, new Dictionary<string, object?>
+        {
+            ["type"] = "response.in_progress",
+            ["response"] = new Dictionary<string, object?>
+            {
+                ["id"] = responseId,
+                ["object"] = "response",
+                ["created_at"] = created,
+                ["status"] = "in_progress",
+                ["model"] = model,
+                ["output"] = Array.Empty<object>()
+            }
+        });
+
+        // 3. 遍历 content blocks
+        if (root.TryGetProperty("content", out var contentEl) && contentEl.ValueKind == JsonValueKind.Array)
+        {
+            var outputIndex = 0;
+            foreach (var block in contentEl.EnumerateArray())
+            {
+                var blockType = block.TryGetProperty("type", out var btEl) ? btEl.GetString() : null;
+
+                if (blockType == "text")
+                {
+                    var text = block.TryGetProperty("text", out var txtEl) ? txtEl.GetString() ?? "" : "";
+                    var itemId = "msg_" + Guid.NewGuid().ToString("N")[..24];
+
+                    // response.output_item.added
+                    await WriteResponsesSseEvent(ctx, new Dictionary<string, object?>
+                    {
+                        ["type"] = "response.output_item.added",
+                        ["output_index"] = outputIndex,
+                        ["item"] = new Dictionary<string, object?>
+                        {
+                            ["id"] = itemId,
+                            ["type"] = "message",
+                            ["status"] = "in_progress",
+                            ["role"] = "assistant",
+                            ["content"] = Array.Empty<object>()
+                        }
+                    });
+
+                    // response.content_part.added
+                    await WriteResponsesSseEvent(ctx, new Dictionary<string, object?>
+                    {
+                        ["type"] = "response.content_part.added",
+                        ["item_id"] = itemId,
+                        ["output_index"] = outputIndex,
+                        ["content_index"] = 0,
+                        ["part"] = new Dictionary<string, object?>
+                        {
+                            ["type"] = "output_text",
+                            ["text"] = "",
+                            ["annotations"] = Array.Empty<object>()
+                        }
+                    });
+
+                    // response.output_text.delta — 分块输出
+                    var chunkSize = 80;
+                    for (var i = 0; i < text.Length; i += chunkSize)
+                    {
+                        var chunk = text.Substring(i, Math.Min(chunkSize, text.Length - i));
+                        await WriteResponsesSseEvent(ctx, new Dictionary<string, object?>
+                        {
+                            ["type"] = "response.output_text.delta",
+                            ["item_id"] = itemId,
+                            ["output_index"] = outputIndex,
+                            ["content_index"] = 0,
+                            ["delta"] = chunk
+                        });
+                    }
+
+                    // response.output_text.done
+                    await WriteResponsesSseEvent(ctx, new Dictionary<string, object?>
+                    {
+                        ["type"] = "response.output_text.done",
+                        ["item_id"] = itemId,
+                        ["output_index"] = outputIndex,
+                        ["content_index"] = 0,
+                        ["text"] = text
+                    });
+
+                    // response.content_part.done
+                    await WriteResponsesSseEvent(ctx, new Dictionary<string, object?>
+                    {
+                        ["type"] = "response.content_part.done",
+                        ["item_id"] = itemId,
+                        ["output_index"] = outputIndex,
+                        ["content_index"] = 0,
+                        ["part"] = new Dictionary<string, object?>
+                        {
+                            ["type"] = "output_text",
+                            ["text"] = text,
+                            ["annotations"] = Array.Empty<object>()
+                        }
+                    });
+
+                    // response.output_item.done
+                    await WriteResponsesSseEvent(ctx, new Dictionary<string, object?>
+                    {
+                        ["type"] = "response.output_item.done",
+                        ["output_index"] = outputIndex,
+                        ["item"] = new Dictionary<string, object?>
+                        {
+                            ["id"] = itemId,
+                            ["type"] = "message",
+                            ["status"] = "completed",
+                            ["role"] = "assistant",
+                            ["content"] = new List<object>
+                            {
+                                new Dictionary<string, object?>
+                                {
+                                    ["type"] = "output_text",
+                                    ["text"] = text,
+                                    ["annotations"] = Array.Empty<object>()
+                                }
+                            }
+                        }
+                    });
+
+                    outputIndex++;
+                }
+                else if (blockType == "tool_use")
+                {
+                    var toolId = block.TryGetProperty("id", out var tidEl) ? tidEl.GetString() ?? "" : "";
+                    var toolName = block.TryGetProperty("name", out var tnEl) ? tnEl.GetString() ?? "" : "";
+                    var toolInput = block.TryGetProperty("input", out var tiEl) ? tiEl.GetRawText() : "{}";
+
+                    // response.output_item.added
+                    await WriteResponsesSseEvent(ctx, new Dictionary<string, object?>
+                    {
+                        ["type"] = "response.output_item.added",
+                        ["output_index"] = outputIndex,
+                        ["item"] = new Dictionary<string, object?>
+                        {
+                            ["id"] = toolId,
+                            ["type"] = "function_call",
+                            ["status"] = "in_progress",
+                            ["call_id"] = toolId,
+                            ["name"] = toolName,
+                            ["arguments"] = ""
+                        }
+                    });
+
+                    // response.function_call_arguments.delta
+                    await WriteResponsesSseEvent(ctx, new Dictionary<string, object?>
+                    {
+                        ["type"] = "response.function_call_arguments.delta",
+                        ["item_id"] = toolId,
+                        ["output_index"] = outputIndex,
+                        ["delta"] = toolInput
+                    });
+
+                    // response.function_call_arguments.done
+                    await WriteResponsesSseEvent(ctx, new Dictionary<string, object?>
+                    {
+                        ["type"] = "response.function_call_arguments.done",
+                        ["item_id"] = toolId,
+                        ["output_index"] = outputIndex,
+                        ["arguments"] = toolInput
+                    });
+
+                    // response.output_item.done
+                    await WriteResponsesSseEvent(ctx, new Dictionary<string, object?>
+                    {
+                        ["type"] = "response.output_item.done",
+                        ["output_index"] = outputIndex,
+                        ["item"] = new Dictionary<string, object?>
+                        {
+                            ["id"] = toolId,
+                            ["type"] = "function_call",
+                            ["status"] = "completed",
+                            ["call_id"] = toolId,
+                            ["name"] = toolName,
+                            ["arguments"] = toolInput
+                        }
+                    });
+
+                    outputIndex++;
+                }
+            }
+        }
+
+        // 4. response.completed
+        var finalStatus = stopReason == "tool_use" ? "incomplete" : "completed";
+        await WriteResponsesSseEvent(ctx, new Dictionary<string, object?>
+        {
+            ["type"] = "response.completed",
+            ["response"] = new Dictionary<string, object?>
+            {
+                ["id"] = responseId,
+                ["object"] = "response",
+                ["created_at"] = created,
+                ["status"] = finalStatus,
+                ["model"] = model,
+                ["usage"] = new Dictionary<string, object?>
+                {
+                    ["input_tokens"] = inputTokens,
+                    ["output_tokens"] = outputTokens,
+                    ["total_tokens"] = inputTokens + outputTokens
+                }
+            }
+        });
+
+        await ctx.Response.Body.FlushAsync();
+    }
+    catch (Exception ex)
+    {
+        logger.LogWarning(ex, "Responses API SSE streaming 转换失败");
+        if (!ctx.Response.HasStarted)
+        {
+            ctx.Response.StatusCode = 502;
+            ctx.Response.ContentType = "application/json";
+            await ctx.Response.WriteAsJsonAsync(new { error = new { message = ex.Message, type = "server_error" } });
+        }
+    }
+}
+
+static async Task WriteResponsesSseEvent(HttpContext ctx, object data)
+{
+    var json = JsonSerializer.Serialize(data);
+    await ctx.Response.WriteAsync($"data: {json}\n\n");
+    await ctx.Response.Body.FlushAsync();
 }
 
 async Task HandleClaudeMessagesAsync(HttpContext ctx)
@@ -1066,6 +1806,7 @@ static async Task<ProxyResult> ForwardToKiroApiAsync(
         };
 
         startInfo.ArgumentList.Add(helperPath);
+        startInfo.Environment["NODE_TLS_REJECT_UNAUTHORIZED"] = "0";
 
         using var process = new Process
         {
@@ -1188,6 +1929,7 @@ static async Task<ProxyResult?> ForwardToKiroModelsAsync(
         };
 
         startInfo.ArgumentList.Add(helperPath);
+        startInfo.Environment["NODE_TLS_REJECT_UNAUTHORIZED"] = "0";
 
         using var process = new Process
         {
@@ -1247,6 +1989,117 @@ static async Task<ProxyResult?> ForwardToKiroModelsAsync(
     {
         logger.LogWarning(ex, "动态探测 Kiro 模型失败，将回退到静态配置");
         return null;
+    }
+}
+
+static async Task<TokenRefreshResult> RefreshKiroTokenAsync(
+    string nodeCommand,
+    string helperPath,
+    string region,
+    string endpoint,
+    string tokenFilePath,
+    string registrationCacheDirectory,
+    bool contentCollectionEnabled,
+    string agentMode)
+{
+    // 先检查 token 是否真的需要刷新（5 分钟内过期才刷新）
+    if (File.Exists(tokenFilePath))
+    {
+        try
+        {
+            var tokenJson = await File.ReadAllTextAsync(tokenFilePath);
+            using var tokenDoc = JsonDocument.Parse(tokenJson);
+            if (tokenDoc.RootElement.TryGetProperty("expiresAt", out var expiresAtEl))
+            {
+                var expiresAtStr = expiresAtEl.GetString();
+                if (DateTime.TryParse(expiresAtStr, null, System.Globalization.DateTimeStyles.RoundtripKind, out var expiresAt))
+                {
+                    if (expiresAt > DateTime.UtcNow.AddMinutes(5))
+                    {
+                        return new TokenRefreshResult(true, expiresAtStr, null);
+                    }
+                }
+            }
+        }
+        catch { /* 解析失败则继续尝试刷新 */ }
+    }
+
+    // 用一个轻量级请求触发 node helper 内部的 refreshTokenIfNeeded
+    if (!File.Exists(helperPath))
+    {
+        return new TokenRefreshResult(false, null, "Helper script not found");
+    }
+
+    try
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = nodeCommand,
+            WorkingDirectory = Directory.GetCurrentDirectory(),
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8
+        };
+
+        startInfo.ArgumentList.Add(helperPath);
+        startInfo.Environment["NODE_TLS_REJECT_UNAUTHORIZED"] = "0";
+
+        using var process = new Process { StartInfo = startInfo };
+        process.Start();
+
+        // 使用 listModels action 来触发 token refresh（它内部会先调 refreshTokenIfNeeded）
+        var payload = JsonSerializer.Serialize(new
+        {
+            action = "listModels",
+            options = new
+            {
+                region,
+                endpoint,
+                tokenFilePath,
+                registrationCacheDirectory,
+                contentCollectionEnabled,
+                agentMode
+            }
+        });
+
+        await process.StandardInput.WriteAsync(payload);
+        await process.StandardInput.FlushAsync();
+        process.StandardInput.Close();
+
+        var stdoutTask = process.StandardOutput.ReadToEndAsync();
+        var stderrTask = process.StandardError.ReadToEndAsync();
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        await process.WaitForExitAsync(cts.Token);
+
+        var stdout = await stdoutTask;
+        var stderr = await stderrTask;
+
+        if (process.ExitCode != 0)
+        {
+            return new TokenRefreshResult(false, null, $"Helper exit code {process.ExitCode}: {stderr}");
+        }
+
+        // 刷新后读取新的过期时间
+        if (File.Exists(tokenFilePath))
+        {
+            var newTokenJson = await File.ReadAllTextAsync(tokenFilePath);
+            using var newTokenDoc = JsonDocument.Parse(newTokenJson);
+            var newExpiresAt = newTokenDoc.RootElement.TryGetProperty("expiresAt", out var newEl)
+                ? newEl.GetString()
+                : "unknown";
+            return new TokenRefreshResult(true, newExpiresAt, null);
+        }
+
+        return new TokenRefreshResult(true, "unknown", null);
+    }
+    catch (Exception ex)
+    {
+        return new TokenRefreshResult(false, null, ex.Message);
     }
 }
 
@@ -1738,3 +2591,5 @@ record ProxyResult(int StatusCode, string Body)
     public static ProxyResult Json(int statusCode, object payload) =>
         new(statusCode, JsonSerializer.Serialize(payload));
 }
+
+record TokenRefreshResult(bool Success, string? ExpiresAt, string? Error);

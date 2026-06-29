@@ -87,7 +87,42 @@ claude
 
 > `ANTHROPIC_API_KEY` 随便填一个值即可，实际认证走 Kiro token。
 
-### 6. 持久化配置（可选）
+### 6. 配置 Codex CLI（OpenAI）
+
+LlmProxy 同时兼容 OpenAI Responses API，可以直接让 Codex CLI 使用。
+
+编辑 `~/.codex/config.toml`：
+
+```toml
+model = "claude-sonnet-4"
+model_provider = "kiro-proxy"
+
+[model_providers.kiro-proxy]
+name = "Kiro LLM Proxy"
+base_url = "http://localhost:3000/v1"
+env_key = "CODEX_PROXY_KEY"
+wire_api = "responses"
+```
+
+然后设置环境变量（值随便填）：
+
+```bash
+export CODEX_PROXY_KEY=dummy-key
+```
+
+Windows PowerShell:
+```powershell
+$env:CODEX_PROXY_KEY="dummy-key"
+```
+
+启动 Codex：
+```bash
+codex
+```
+
+> 支持文本生成和 function calling（工具调用），Codex 的所有代码操作功能均可正常工作。
+
+### 7. 持久化配置（可选）
 
 不想每次都设环境变量，可以写入 shell 配置：
 
