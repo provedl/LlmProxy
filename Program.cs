@@ -62,6 +62,9 @@ var configuredModels = config.GetSection("Proxy:Models:Available").Get<string[]>
                        ["claude-sonnet-4", "claude-opus-4.1", "kiro-default"];
 var defaultModel = config["Proxy:Models:Default"] ?? configuredModels.First();
 var kiroHelperPath = Path.Combine(app.Environment.ContentRootPath, "kiro-api-helper.cjs");
+var maxRequestBodyBytes = config.GetValue("Proxy:ContextTruncation:MaxRequestBodyBytes", 800_000);
+var keepRecentMessages = config.GetValue("Proxy:ContextTruncation:KeepRecentMessages", 20);
+var truncationEnabled = config.GetValue("Proxy:ContextTruncation:Enabled", true);
 
 if (cacheEnabled && !Directory.Exists(cacheDir))
 {
@@ -806,29 +809,40 @@ async Task HandleResponsesApiAsync(HttpContext ctx)
         var anthropicRequestJson = JsonSerializer.Serialize(anthropicRequest);
         logger.LogInformation("Responses API → Anthropic Messages 转换完成, model={Model}, messages={Count}", model, messages.Count);
 
-        // 调用后端
-        ProxyResult result = backend.Equals("KiroApi", StringComparison.OrdinalIgnoreCase)
-            ? await ForwardToKiroApiAsync(
-                anthropicRequestJson,
-                kiroNodeCommand,
-                kiroHelperPath,
-                kiroRegion,
-                kiroEndpoint,
-                kiroTokenFilePath,
-                kiroRegistrationCacheDirectory,
-                kiroContentCollectionEnabled,
-                kiroAgentMode,
-                logger,
-                ctx.RequestAborted)
-            : await ForwardToAnthropicAsync(
-                ctx,
-                anthropicRequestJson,
-                upstreamBaseUrl,
-                upstreamApiKey,
-                maxRetries,
-                clientFactory,
-                logger,
-                ctx.RequestAborted);
+        if (truncationEnabled)
+        {
+            anthropicRequestJson = TruncateMessagesIfNeeded(anthropicRequestJson, maxRequestBodyBytes, keepRecentMessages, logger);
+        }
+
+        // 调用后端（带自动截断重试）
+        var effectiveBody = anthropicRequestJson;
+
+        async Task<ProxyResult> CallBackendForResponses(string body) =>
+            backend.Equals("KiroApi", StringComparison.OrdinalIgnoreCase)
+                ? await ForwardToKiroApiAsync(
+                    body, kiroNodeCommand, kiroHelperPath, kiroRegion, kiroEndpoint,
+                    kiroTokenFilePath, kiroRegistrationCacheDirectory,
+                    kiroContentCollectionEnabled, kiroAgentMode, logger, ctx.RequestAborted)
+                : await ForwardToAnthropicAsync(
+                    ctx, body, upstreamBaseUrl, upstreamApiKey, maxRetries,
+                    clientFactory, logger, ctx.RequestAborted);
+
+        var result = await CallBackendForResponses(effectiveBody);
+
+        // 如果上游过载且请求体较大，进一步截断后重试
+        if (truncationEnabled && result.StatusCode is 429 or 502 or 503 or 529
+            && Encoding.UTF8.GetByteCount(effectiveBody) > maxRequestBodyBytes / 2)
+        {
+            logger.LogWarning("Codex 请求上游返回 {StatusCode}，尝试进一步截断上下文后重试", result.StatusCode);
+            var aggressiveKeep = Math.Max(keepRecentMessages / 2, 6);
+            var truncatedBody = TruncateMessagesIfNeeded(effectiveBody, maxRequestBodyBytes / 2, aggressiveKeep, logger);
+            if (truncatedBody != effectiveBody)
+            {
+                effectiveBody = truncatedBody;
+                await Task.Delay(2000, ctx.RequestAborted);
+                result = await CallBackendForResponses(effectiveBody);
+            }
+        }
 
         if (result.StatusCode is >= 200 and < 300)
         {
@@ -837,7 +851,6 @@ async Task HandleResponsesApiAsync(HttpContext ctx)
 
         if (result.StatusCode is not (>= 200 and < 300))
         {
-            // 错误响应
             ctx.Response.StatusCode = result.StatusCode;
             ctx.Response.ContentType = "application/json";
             await ctx.Response.WriteAsJsonAsync(new
@@ -2103,6 +2116,86 @@ static async Task<TokenRefreshResult> RefreshKiroTokenAsync(
     }
 }
 
+/// <summary>
+/// 当请求体超过 maxBytes 时，裁剪中间的旧消息，保留 system + 前2条 + 最近 keepRecent 条消息。
+/// 这样可以避免因对话太长导致上游返回 "high demand" / 529 / 503 等错误。
+/// </summary>
+static string TruncateMessagesIfNeeded(string requestBody, int maxBytes, int keepRecent, Microsoft.Extensions.Logging.ILogger logger)
+{
+    if (Encoding.UTF8.GetByteCount(requestBody) <= maxBytes)
+    {
+        return requestBody;
+    }
+
+    try
+    {
+        using var doc = JsonDocument.Parse(requestBody);
+        var root = doc.RootElement;
+
+        if (!root.TryGetProperty("messages", out var messagesEl) || messagesEl.ValueKind != JsonValueKind.Array)
+        {
+            return requestBody;
+        }
+
+        var messages = new List<JsonElement>();
+        foreach (var msg in messagesEl.EnumerateArray())
+        {
+            messages.Add(msg.Clone());
+        }
+
+        if (messages.Count <= keepRecent + 2)
+        {
+            return requestBody;
+        }
+
+        var keepFirst = 2;
+        var totalToKeep = keepFirst + keepRecent;
+        var trimmed = messages.Count;
+
+        while (messages.Count > totalToKeep && Encoding.UTF8.GetByteCount(RebuildRequestJson(root, messages)) > maxBytes)
+        {
+            messages.RemoveAt(keepFirst);
+        }
+
+        if (messages.Count < trimmed)
+        {
+            logger.LogWarning(
+                "上下文截断: 原始 {OriginalCount} 条消息裁剪为 {TrimmedCount} 条 (保留前{KeepFirst}条+最近{KeepRecent}条), 原始大小: {OriginalSize} bytes",
+                trimmed, messages.Count, keepFirst, keepRecent, Encoding.UTF8.GetByteCount(requestBody));
+
+            var result = RebuildRequestJson(root, messages);
+            logger.LogInformation("截断后请求体大小: {Size} bytes", Encoding.UTF8.GetByteCount(result));
+            return result;
+        }
+
+        return requestBody;
+    }
+    catch (Exception ex)
+    {
+        logger.LogWarning(ex, "上下文截断处理失败，使用原始请求体");
+        return requestBody;
+    }
+}
+
+/// <summary>
+/// 用裁剪后的 messages 列表重新构建请求 JSON，保留其他所有字段不变。
+/// </summary>
+static string RebuildRequestJson(JsonElement originalRoot, List<JsonElement> newMessages)
+{
+    var dict = new Dictionary<string, object?>();
+    foreach (var prop in originalRoot.EnumerateObject())
+    {
+        if (prop.Name == "messages")
+        {
+            dict["messages"] = newMessages.Select(m => JsonSerializer.Deserialize<object>(m.GetRawText())).ToList();
+        }
+        else
+        {
+            dict[prop.Name] = JsonSerializer.Deserialize<object>(prop.Value.GetRawText());
+        }
+    }
+    return JsonSerializer.Serialize(dict);
+}
 static ClaudeMessagesRequest ParseClaudeMessagesRequest(string requestBody)
 {
     using var document = JsonDocument.Parse(requestBody);
