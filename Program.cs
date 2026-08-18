@@ -87,6 +87,19 @@ Log.Information(
 app.MapGet("/", () => Results.Redirect("/swagger"))
     .ExcludeFromDescription();
 
+
+app.MapGet("/api/hello", () => Results.Ok(new { status = "ok" }))
+    .WithName("ApiHello")
+    .WithTags("System")
+    .WithSummary("Connectivity check endpoint for Claude Code")
+    .Produces(StatusCodes.Status200OK);
+
+app.MapGet("/v1/oauth/hello", () => Results.Ok(new { status = "ok" }))
+    .WithName("OAuthHello")
+    .WithTags("System")
+    .WithSummary("OAuth connectivity check endpoint for Claude Code")
+    .Produces(StatusCodes.Status200OK);
+
 app.MapGet("/health", () => Results.Ok(new
 {
     status = "healthy",
