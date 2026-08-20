@@ -98,6 +98,29 @@ function extractTextParts(content) {
     .map((part) => part.text);
 }
 
+function imageFormatFromMediaType(mediaType) {
+  const normalized = String(mediaType || "").toLowerCase();
+  if (normalized.includes("png")) return "png";
+  if (normalized.includes("gif")) return "gif";
+  if (normalized.includes("webp")) return "webp";
+  return "jpeg";
+}
+
+function extractImages(content) {
+  if (!Array.isArray(content)) {
+    return [];
+  }
+
+  return content
+    .filter((part) => part && part.type === "image" && part.source?.type === "base64" && typeof part.source.data === "string")
+    .map((part) => ({
+      format: imageFormatFromMediaType(part.source.media_type),
+      source: {
+        bytes: Buffer.from(part.source.data, "base64")
+      }
+    }));
+}
+
 function extractToolUses(content) {
   if (!Array.isArray(content)) {
     return [];
@@ -156,10 +179,46 @@ function extractToolResults(content) {
     .filter((toolResult) => toolResult.toolUseId);
 }
 
-function convertClaudeMessageToKiroMessage(message) {
-  const text = extractTextParts(message.content).join("\n\n");
-  const toolUses = extractToolUses(message.content);
-  const toolResults = extractToolResults(message.content);
+function toolHistoryAsText(content) {
+  if (!Array.isArray(content)) {
+    return [];
+  }
+
+  return content
+    .map((part) => {
+      if (!part || typeof part !== "object") {
+        return null;
+      }
+
+      if (part.type === "tool_use") {
+        return [
+          `[Tool use: ${part.name || "tool"}]`,
+          part.id ? `id: ${part.id}` : null,
+          `input: ${JSON.stringify(part.input || {})}`
+        ].filter(Boolean).join("\n");
+      }
+
+      if (part.type === "tool_result") {
+        return [
+          `[Tool result${part.tool_use_id ? ` for ${part.tool_use_id}` : ""}${part.is_error ? " (error)" : ""}]`,
+          toolResultContentToText(part.content)
+        ].filter(Boolean).join("\n");
+      }
+
+      return null;
+    })
+    .filter(Boolean);
+}
+
+function convertClaudeMessageToKiroMessage(message, options = {}) {
+  const textParts = extractTextParts(message.content);
+  const text = [
+    ...textParts,
+    ...(options.preserveToolBlocks === false ? toolHistoryAsText(message.content) : [])
+  ].join("\n\n");
+  const images = extractImages(message.content);
+  const toolUses = options.preserveToolBlocks === false ? [] : extractToolUses(message.content);
+  const toolResults = options.preserveToolBlocks === false ? [] : extractToolResults(message.content);
 
   if (message.role === "assistant") {
     return {
@@ -174,6 +233,7 @@ function convertClaudeMessageToKiroMessage(message) {
     userInputMessage: {
       content: text,
       origin: "AI_EDITOR",
+      ...(images.length > 0 ? { images } : {}),
       ...(toolResults.length > 0
         ? {
             userInputMessageContext: {
@@ -250,7 +310,12 @@ function normalizeClaudeRequest(request) {
 
 function buildConversationState(request) {
   const normalized = normalizeClaudeRequest(request);
-  const kiroMessages = normalized.messages.map(convertClaudeMessageToKiroMessage);
+  const tools = convertClaudeTools(normalized.tools);
+  const kiroMessages = normalized.messages.map((message) =>
+    convertClaudeMessageToKiroMessage(message, {
+      preserveToolBlocks: Boolean(tools)
+    })
+  );
 
   if (kiroMessages.length === 0) {
     throw new Error("No messages provided");
@@ -261,7 +326,6 @@ function buildConversationState(request) {
     throw new Error("Latest message must be a user message");
   }
 
-  const tools = convertClaudeTools(normalized.tools);
   if (tools) {
     currentMessage.userInputMessage.userInputMessageContext = {
       ...(currentMessage.userInputMessage.userInputMessageContext || {}),
@@ -590,6 +654,7 @@ async function listAvailableModels(options) {
 async function callKiroApi(request, options) {
   const conversationState = buildConversationState(request);
   const token = await refreshTokenIfNeeded(options.tokenFilePath, options.registrationCacheDirectory);
+  const profileArn = await resolveProfileArn(token, options);
 
   const client = new CodeWhispererStreaming({
     region: options.region,
@@ -605,7 +670,8 @@ async function callKiroApi(request, options) {
   );
 
   const command = new GenerateAssistantResponseCommand({
-    conversationState
+    conversationState,
+    profileArn
   });
 
   let response;
@@ -633,14 +699,15 @@ async function callKiroApi(request, options) {
     }
   }
 
-  if (!response.generateAssistantResponseResponse) {
+  const responseStream = response.generateAssistantResponseResponse || response.sendMessageResponse;
+  if (!responseStream) {
     throw new Error("No response stream returned from Kiro API");
   }
 
   let fullText = "";
   const toolUseMap = new Map();
 
-  for await (const event of response.generateAssistantResponseResponse) {
+  for await (const event of responseStream) {
     if (event.assistantResponseEvent?.content) {
       fullText += event.assistantResponseEvent.content;
     }

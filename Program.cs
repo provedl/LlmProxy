@@ -937,30 +937,111 @@ static List<Dictionary<string, object?>> ConvertResponsesInputToMessages(JsonEle
             if (content.ValueKind == JsonValueKind.String)
             {
                 textContent = content.GetString();
+                if (!string.IsNullOrEmpty(textContent))
+                {
+                    messages.Add(new Dictionary<string, object?>
+                    {
+                        ["role"] = effectiveRole == "assistant" ? "assistant" : "user",
+                        ["content"] = textContent
+                    });
+                }
             }
             else if (content.ValueKind == JsonValueKind.Array)
             {
-                // 提取 text 类型的内容
-                var parts = new List<string>();
+                // 提取 text 和 image 类型的内容，构建 Anthropic 的 content blocks
+                var contentBlocks = new List<object>();
                 foreach (var part in content.EnumerateArray())
                 {
                     var partType = part.TryGetProperty("type", out var ptEl) ? ptEl.GetString() : null;
                     if (partType is "input_text" or "text" or "output_text")
                     {
                         var text = part.TryGetProperty("text", out var txtEl) ? txtEl.GetString() : null;
-                        if (text != null) parts.Add(text);
+                        if (!string.IsNullOrEmpty(text))
+                        {
+                            contentBlocks.Add(new Dictionary<string, object?> { ["type"] = "text", ["text"] = text });
+                        }
+                    }
+                    else if (partType is "input_image" or "image_url")
+                    {
+                        // 处理图片: 支持 data URL 和普通 URL 两种格式
+                        string? imageUrl = null;
+                        if (part.TryGetProperty("image_url", out var imgUrlEl))
+                        {
+                            imageUrl = imgUrlEl.ValueKind == JsonValueKind.String
+                                ? imgUrlEl.GetString()
+                                : imgUrlEl.TryGetProperty("url", out var urlEl) ? urlEl.GetString() : null;
+                        }
+                        else if (part.TryGetProperty("url", out var urlEl2))
+                        {
+                            imageUrl = urlEl2.GetString();
+                        }
+
+                        if (!string.IsNullOrEmpty(imageUrl) && imageUrl.StartsWith("data:"))
+                        {
+                            // 解析 data:image/png;base64,xxxx
+                            var commaIdx = imageUrl.IndexOf(',');
+                            if (commaIdx > 0)
+                            {
+                                var header = imageUrl[5..commaIdx]; // "image/png;base64"
+                                var mediaType = header.Split(';')[0]; // "image/png"
+                                var base64Data = imageUrl[(commaIdx + 1)..];
+                                contentBlocks.Add(new Dictionary<string, object?>
+                                {
+                                    ["type"] = "image",
+                                    ["source"] = new Dictionary<string, object?>
+                                    {
+                                        ["type"] = "base64",
+                                        ["media_type"] = mediaType,
+                                        ["data"] = base64Data
+                                    }
+                                });
+                            }
+                        }
+                        else if (!string.IsNullOrEmpty(imageUrl))
+                        {
+                            // URL 类型图片
+                            contentBlocks.Add(new Dictionary<string, object?>
+                            {
+                                ["type"] = "image",
+                                ["source"] = new Dictionary<string, object?>
+                                {
+                                    ["type"] = "url",
+                                    ["url"] = imageUrl
+                                }
+                            });
+                        }
                     }
                 }
-                textContent = string.Join("\n", parts);
-            }
 
-            if (!string.IsNullOrEmpty(textContent))
-            {
-                messages.Add(new Dictionary<string, object?>
+                // 如果只有文本，合并成单个字符串；否则保持 content blocks 结构
+                if (contentBlocks.Count > 0)
                 {
-                    ["role"] = effectiveRole == "assistant" ? "assistant" : "user",
-                    ["content"] = textContent
-                });
+                    var hasImage = contentBlocks.Any(b => b is Dictionary<string, object?> d && d.TryGetValue("type", out var t) && t?.ToString() == "image");
+                    if (hasImage)
+                    {
+                        // 有图片，使用 content blocks 格式
+                        messages.Add(new Dictionary<string, object?>
+                        {
+                            ["role"] = effectiveRole == "assistant" ? "assistant" : "user",
+                            ["content"] = contentBlocks
+                        });
+                    }
+                    else
+                    {
+                        // 纯文本，合并成字符串
+                        var combinedText = string.Join("\n", contentBlocks
+                            .Where(b => b is Dictionary<string, object?> d && d.TryGetValue("type", out var t) && t?.ToString() == "text")
+                            .Select(b => ((Dictionary<string, object?>)b)["text"]?.ToString() ?? ""));
+                        if (!string.IsNullOrEmpty(combinedText))
+                        {
+                            messages.Add(new Dictionary<string, object?>
+                            {
+                                ["role"] = effectiveRole == "assistant" ? "assistant" : "user",
+                                ["content"] = combinedText
+                            });
+                        }
+                    }
+                }
             }
         }
         // 处理 function_call 类型 → 映射为 assistant 的 tool_use
@@ -968,16 +1049,24 @@ static List<Dictionary<string, object?>> ConvertResponsesInputToMessages(JsonEle
         {
             var callId = item.TryGetProperty("call_id", out var cidEl) ? cidEl.GetString() ?? "" : "";
             var name = item.TryGetProperty("name", out var nameEl) ? nameEl.GetString() ?? "" : "";
-            var arguments = item.TryGetProperty("arguments", out var argsEl) ? argsEl.GetString() ?? "{}" : "{}";
+            
+            // arguments 可能是 string（JSON 字符串）或直接是 object/array
+            string argumentsRaw = "{}";
+            if (item.TryGetProperty("arguments", out var argsEl))
+            {
+                argumentsRaw = argsEl.ValueKind == JsonValueKind.String
+                    ? argsEl.GetString() ?? "{}"
+                    : argsEl.GetRawText();
+            }
 
             object? parsedInput;
             try
             {
-                parsedInput = JsonSerializer.Deserialize<object>(arguments);
+                parsedInput = JsonSerializer.Deserialize<object>(argumentsRaw);
             }
             catch
             {
-                parsedInput = new { };
+                parsedInput = new { raw = argumentsRaw };
             }
 
             // 将 function_call 合并到上一个 assistant 消息中，或创建新的
@@ -1008,7 +1097,15 @@ static List<Dictionary<string, object?>> ConvertResponsesInputToMessages(JsonEle
         else if (type == "function_call_output")
         {
             var callId = item.TryGetProperty("call_id", out var cidEl) ? cidEl.GetString() ?? "" : "";
-            var output = item.TryGetProperty("output", out var outEl) ? outEl.GetString() ?? "" : "";
+            
+            // output 可能是 string 或 object/array
+            string output = "";
+            if (item.TryGetProperty("output", out var outEl))
+            {
+                output = outEl.ValueKind == JsonValueKind.String
+                    ? outEl.GetString() ?? ""
+                    : outEl.GetRawText();
+            }
 
             messages.Add(new Dictionary<string, object?>
             {
@@ -1453,6 +1550,15 @@ async Task HandleClaudeMessagesAsync(HttpContext ctx)
     var requestBody = await reader.ReadToEndAsync();
 
     logger.LogInformation("收到代理请求, 大小: {Size} bytes, 后端: {Backend}", requestBody.Length, backend);
+    
+    // 检测请求中是否包含图片
+    var hasImage = requestBody.Contains("\"type\":\"image\"") || requestBody.Contains("\"type\": \"image\"");
+    var hasBase64 = requestBody.Contains("\"type\":\"base64\"") || requestBody.Contains("\"type\": \"base64\"");
+    var hasUrl = requestBody.Contains("\"type\":\"url\"") || requestBody.Contains("\"type\": \"url\"");
+    if (hasImage || hasBase64 || hasUrl)
+    {
+        logger.LogInformation("请求包含图片: image={HasImage}, base64={HasBase64}, url={HasUrl}", hasImage, hasBase64, hasUrl);
+    }
 
     ClaudeMessagesRequest requestModel;
     try

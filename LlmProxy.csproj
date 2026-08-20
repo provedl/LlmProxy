@@ -7,6 +7,13 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- 排除参考目录，避免编译冲突 -->
+    <Compile Remove="LLMPROXY-main\**\*.cs" />
+    <Content Remove="LLMPROXY-main\**\*" />
+    <None Remove="LLMPROXY-main\**\*" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.11" />
     <PackageReference Include="Serilog.AspNetCore" Version="8.0.3" />
     <PackageReference Include="Serilog.Sinks.Console" Version="6.0.0" />
