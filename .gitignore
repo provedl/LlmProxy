@@ -9,3 +9,4 @@ data/
 *.user
 *.suo
 .claude/
+/publish
