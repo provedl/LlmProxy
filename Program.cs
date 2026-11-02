@@ -1123,7 +1123,103 @@ static List<Dictionary<string, object?>> ConvertResponsesInputToMessages(JsonEle
         }
     }
 
-    return messages;
+    // 验证并修复 tool_use 和 tool_result 的配对关系
+    return SanitizeToolResultsInMessages(messages, logger);
+}
+
+/// <summary>
+/// 验证并修复 tool_use 和 tool_result 的配对关系（用于 Dictionary 格式的消息列表）。
+/// Anthropic API 要求：每个 tool_result 必须在前一条消息中有对应的 tool_use。
+/// </summary>
+static List<Dictionary<string, object?>> SanitizeToolResultsInMessages(
+    List<Dictionary<string, object?>> messages, 
+    Microsoft.Extensions.Logging.ILogger logger)
+{
+    // 第一遍：收集所有 tool_use 的 id
+    var toolUseIds = new HashSet<string>();
+    foreach (var msg in messages)
+    {
+        if (!msg.TryGetValue("role", out var roleObj) || roleObj?.ToString() != "assistant")
+            continue;
+        if (!msg.TryGetValue("content", out var contentObj) || contentObj is not List<object> contentList)
+            continue;
+
+        foreach (var block in contentList)
+        {
+            if (block is Dictionary<string, object?> blockDict &&
+                blockDict.TryGetValue("type", out var typeObj) && typeObj?.ToString() == "tool_use" &&
+                blockDict.TryGetValue("id", out var idObj) && idObj is string id && !string.IsNullOrEmpty(id))
+            {
+                toolUseIds.Add(id);
+            }
+        }
+    }
+
+    // 第二遍：移除没有对应 tool_use 的 tool_result
+    var sanitized = new List<Dictionary<string, object?>>();
+    var removedCount = 0;
+
+    foreach (var msg in messages)
+    {
+        if (!msg.TryGetValue("role", out var roleObj) || roleObj?.ToString() != "user")
+        {
+            sanitized.Add(msg);
+            continue;
+        }
+
+        if (!msg.TryGetValue("content", out var contentObj) || contentObj is not List<object> contentList)
+        {
+            sanitized.Add(msg);
+            continue;
+        }
+
+        var validBlocks = new List<object>();
+        var hasOrphanToolResult = false;
+
+        foreach (var block in contentList)
+        {
+            if (block is Dictionary<string, object?> blockDict &&
+                blockDict.TryGetValue("type", out var typeObj) && typeObj?.ToString() == "tool_result")
+            {
+                if (blockDict.TryGetValue("tool_use_id", out var idObj) && idObj is string toolUseId && 
+                    !string.IsNullOrEmpty(toolUseId) && toolUseIds.Contains(toolUseId))
+                {
+                    validBlocks.Add(block);
+                }
+                else
+                {
+                    hasOrphanToolResult = true;
+                    removedCount++;
+                    logger.LogDebug("移除孤立的 tool_result, tool_use_id={ToolUseId}", idObj);
+                }
+            }
+            else
+            {
+                validBlocks.Add(block);
+            }
+        }
+
+        if (hasOrphanToolResult)
+        {
+            if (validBlocks.Count == 0)
+            {
+                logger.LogDebug("移除空的 user 消息（所有 tool_result 都是孤立的）");
+                continue;
+            }
+            sanitized.Add(new Dictionary<string, object?> { ["role"] = "user", ["content"] = validBlocks });
+        }
+        else
+        {
+            sanitized.Add(msg);
+        }
+    }
+
+    if (removedCount > 0)
+    {
+        logger.LogWarning("ConvertResponsesInputToMessages: 移除了 {Count} 个孤立的 tool_result", removedCount);
+    }
+
+    return sanitized;
 }
 
 /// <summary>
@@ -2238,6 +2334,7 @@ static async Task<TokenRefreshResult> RefreshKiroTokenAsync(
 /// <summary>
 /// 当请求体超过 maxBytes 时，裁剪中间的旧消息，保留 system + 前2条 + 最近 keepRecent 条消息。
 /// 这样可以避免因对话太长导致上游返回 "high demand" / 529 / 503 等错误。
+/// 注意：截断后会调用 SanitizeToolUseResultPairs 确保 tool_use 和 tool_result 配对正确。
 /// </summary>
 static string TruncateMessagesIfNeeded(string requestBody, int maxBytes, int keepRecent, Microsoft.Extensions.Logging.ILogger logger)
 {
@@ -2282,6 +2379,9 @@ static string TruncateMessagesIfNeeded(string requestBody, int maxBytes, int kee
                 "上下文截断: 原始 {OriginalCount} 条消息裁剪为 {TrimmedCount} 条 (保留前{KeepFirst}条+最近{KeepRecent}条), 原始大小: {OriginalSize} bytes",
                 trimmed, messages.Count, keepFirst, keepRecent, Encoding.UTF8.GetByteCount(requestBody));
 
+            // 截断后需要修复 tool_use 和 tool_result 的配对关系
+            messages = SanitizeToolUseResultPairs(messages, logger);
+
             var result = RebuildRequestJson(root, messages);
             logger.LogInformation("截断后请求体大小: {Size} bytes", Encoding.UTF8.GetByteCount(result));
             return result;
@@ -2294,6 +2394,139 @@ static string TruncateMessagesIfNeeded(string requestBody, int maxBytes, int kee
         logger.LogWarning(ex, "上下文截断处理失败，使用原始请求体");
         return requestBody;
     }
+}
+
+/// <summary>
+/// 确保 tool_use 和 tool_result 正确配对。
+/// Anthropic API 要求：每个 tool_result 必须在前一条消息中有对应的 tool_use。
+/// 此函数会：
+/// 1. 收集所有 tool_use 的 id
+/// 2. 移除没有对应 tool_use 的 tool_result
+/// 3. 如果一条 user 消息在移除孤立 tool_result 后为空，则移除该消息
+/// </summary>
+static List<JsonElement> SanitizeToolUseResultPairs(List<JsonElement> messages, Microsoft.Extensions.Logging.ILogger logger)
+{
+    // 第一遍：收集所有 tool_use 的 id
+    var toolUseIds = new HashSet<string>();
+    foreach (var msg in messages)
+    {
+        if (!msg.TryGetProperty("role", out var roleEl) || roleEl.GetString() != "assistant")
+            continue;
+        if (!msg.TryGetProperty("content", out var contentEl) || contentEl.ValueKind != JsonValueKind.Array)
+            continue;
+
+        foreach (var block in contentEl.EnumerateArray())
+        {
+            if (block.TryGetProperty("type", out var typeEl) && typeEl.GetString() == "tool_use")
+            {
+                if (block.TryGetProperty("id", out var idEl) && idEl.ValueKind == JsonValueKind.String)
+                {
+                    var id = idEl.GetString();
+                    if (!string.IsNullOrEmpty(id))
+                    {
+                        toolUseIds.Add(id);
+                    }
+                }
+            }
+        }
+    }
+
+    // 第二遍：移除没有对应 tool_use 的 tool_result，并清理空消息
+    var sanitized = new List<JsonElement>();
+    var removedCount = 0;
+
+    foreach (var msg in messages)
+    {
+        if (!msg.TryGetProperty("role", out var roleEl))
+        {
+            sanitized.Add(msg);
+            continue;
+        }
+
+        var role = roleEl.GetString();
+
+        // 只处理 user 消息中的 tool_result
+        if (role != "user")
+        {
+            sanitized.Add(msg);
+            continue;
+        }
+
+        if (!msg.TryGetProperty("content", out var contentEl) || contentEl.ValueKind != JsonValueKind.Array)
+        {
+            sanitized.Add(msg);
+            continue;
+        }
+
+        // 检查是否包含 tool_result
+        var hasOrphanToolResult = false;
+        var validBlocks = new List<object>();
+
+        foreach (var block in contentEl.EnumerateArray())
+        {
+            if (block.TryGetProperty("type", out var typeEl) && typeEl.GetString() == "tool_result")
+            {
+                if (block.TryGetProperty("tool_use_id", out var idEl) && idEl.ValueKind == JsonValueKind.String)
+                {
+                    var toolUseId = idEl.GetString();
+                    if (!string.IsNullOrEmpty(toolUseId) && toolUseIds.Contains(toolUseId))
+                    {
+                        // 有对应的 tool_use，保留
+                        validBlocks.Add(JsonSerializer.Deserialize<object>(block.GetRawText())!);
+                    }
+                    else
+                    {
+                        // 没有对应的 tool_use，移除
+                        hasOrphanToolResult = true;
+                        removedCount++;
+                        logger.LogDebug("移除孤立的 tool_result, tool_use_id={ToolUseId}", toolUseId);
+                    }
+                }
+                else
+                {
+                    // 没有 tool_use_id，移除
+                    hasOrphanToolResult = true;
+                    removedCount++;
+                }
+            }
+            else
+            {
+                // 非 tool_result 块，保留
+                validBlocks.Add(JsonSerializer.Deserialize<object>(block.GetRawText())!);
+            }
+        }
+
+        if (hasOrphanToolResult)
+        {
+            if (validBlocks.Count == 0)
+            {
+                // 消息变空了，跳过
+                logger.LogDebug("移除空的 user 消息（所有 tool_result 都是孤立的）");
+                continue;
+            }
+
+            // 重建消息
+            var newMsg = new Dictionary<string, object?>
+            {
+                ["role"] = "user",
+                ["content"] = validBlocks
+            };
+            var newMsgJson = JsonSerializer.Serialize(newMsg);
+            using var newDoc = JsonDocument.Parse(newMsgJson);
+            sanitized.Add(newDoc.RootElement.Clone());
+        }
+        else
+        {
+            sanitized.Add(msg);
+        }
+    }
+
+    if (removedCount > 0)
+    {
+        logger.LogWarning("移除了 {Count} 个孤立的 tool_result（没有对应的 tool_use）", removedCount);
+    }
+
+    return sanitized;
 }
 
 /// <summary>

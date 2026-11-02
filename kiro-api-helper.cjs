@@ -393,16 +393,160 @@ function estimateInputTokens(request) {
   return estimateTokens(text);
 }
 
+/**
+ * Extract XML-formatted tool calls from text output.
+ * Some models output tool calls in XML format instead of via toolUseEvent.
+ * Supported formats:
+ *   - Standard: [invoke name="Tool"][parameter name="p"]value[/parameter][/invoke]
+ *   - Anthropic style: [antml:invoke name="Tool"][antml:parameter name="p"]value[/antml:parameter][/antml:invoke]
+ *   - Function calls style: [antml:function_calls][antml:invoke]...[/antml:invoke][/antml:function_calls]
+ * (Note: XML tags shown with [] to avoid parsing issues in source)
+ * Returns { cleanedText, extractedTools }
+ */
+function extractXmlToolCalls(text) {
+  if (!text || typeof text !== "string") {
+    return { cleanedText: text || "", extractedTools: [] };
+  }
+
+  const extractedTools = [];
+  let cleanedText = text;
+
+  // Pattern 1: antml:function_calls wrapper with antml:invoke blocks
+  const functionCallsPattern = /<function_calls>([\s\S]*?)<\/antml:function_calls>/gi;
+  const invokePattern = /<invoke\s+name="([^"]+)">([\s\S]*?)<\/antml:invoke>/gi;
+  const paramPattern = /<parameter\s+name="([^"]+)">([\s\S]*?)<\/antml:parameter>/gi;
+
+  // Pattern 2: Simple invoke blocks (without antml: prefix)
+  const simpleInvokePattern = /<invoke\s+name="([^"]+)">([\s\S]*?)<\/invoke>/gi;
+  const simpleParamPattern = /<parameter\s+name="([^"]+)">([\s\S]*?)<\/parameter>/gi;
+
+  // First, try to extract from antml:function_calls wrapper
+  let functionCallsMatch;
+  while ((functionCallsMatch = functionCallsPattern.exec(text)) !== null) {
+    const innerContent = functionCallsMatch[1];
+    let invokeMatch;
+    const localInvokePattern = /<invoke\s+name="([^"]+)">([\s\S]*?)<\/antml:invoke>/gi;
+
+    while ((invokeMatch = localInvokePattern.exec(innerContent)) !== null) {
+      const toolName = invokeMatch[1];
+      const paramsContent = invokeMatch[2];
+      const params = {};
+
+      let paramMatch;
+      const localParamPattern = /<parameter\s+name="([^"]+)">([\s\S]*?)<\/antml:parameter>/gi;
+      while ((paramMatch = localParamPattern.exec(paramsContent)) !== null) {
+        const paramName = paramMatch[1];
+        let paramValue = paramMatch[2];
+
+        // Try to parse as JSON if it looks like JSON
+        if (paramValue.trim().startsWith("{") || paramValue.trim().startsWith("[")) {
+          try {
+            paramValue = JSON.parse(paramValue);
+          } catch {
+            // Keep as string
+          }
+        }
+        params[paramName] = paramValue;
+      }
+
+      extractedTools.push({
+        id: `toolu_xml_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`,
+        name: toolName,
+        input: params
+      });
+    }
+
+    // Remove the matched function_calls block from text
+    cleanedText = cleanedText.replace(functionCallsMatch[0], "");
+  }
+
+  // Also try standalone antml:invoke blocks (not wrapped in function_calls)
+  let standaloneInvokeMatch;
+  const standaloneInvokePattern = /<invoke\s+name="([^"]+)">([\s\S]*?)<\/antml:invoke>/gi;
+  while ((standaloneInvokeMatch = standaloneInvokePattern.exec(cleanedText)) !== null) {
+    const toolName = standaloneInvokeMatch[1];
+    const paramsContent = standaloneInvokeMatch[2];
+    const params = {};
+
+    let paramMatch;
+    const localParamPattern = /<parameter\s+name="([^"]+)">([\s\S]*?)<\/antml:parameter>/gi;
+    while ((paramMatch = localParamPattern.exec(paramsContent)) !== null) {
+      const paramName = paramMatch[1];
+      let paramValue = paramMatch[2];
+
+      if (paramValue.trim().startsWith("{") || paramValue.trim().startsWith("[")) {
+        try {
+          paramValue = JSON.parse(paramValue);
+        } catch {
+          // Keep as string
+        }
+      }
+      params[paramName] = paramValue;
+    }
+
+    extractedTools.push({
+      id: `toolu_xml_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`,
+      name: toolName,
+      input: params
+    });
+
+    cleanedText = cleanedText.replace(standaloneInvokeMatch[0], "");
+  }
+
+  // Try simple invoke pattern (without antml: prefix)
+  let simpleMatch;
+  while ((simpleMatch = simpleInvokePattern.exec(cleanedText)) !== null) {
+    const toolName = simpleMatch[1];
+    const paramsContent = simpleMatch[2];
+    const params = {};
+
+    let paramMatch;
+    const localParamPattern = /<parameter\s+name="([^"]+)">([\s\S]*?)<\/parameter>/gi;
+    while ((paramMatch = localParamPattern.exec(paramsContent)) !== null) {
+      const paramName = paramMatch[1];
+      let paramValue = paramMatch[2];
+
+      if (paramValue.trim().startsWith("{") || paramValue.trim().startsWith("[")) {
+        try {
+          paramValue = JSON.parse(paramValue);
+        } catch {
+          // Keep as string
+        }
+      }
+      params[paramName] = paramValue;
+    }
+
+    extractedTools.push({
+      id: `toolu_xml_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`,
+      name: toolName,
+      input: params
+    });
+
+    cleanedText = cleanedText.replace(simpleMatch[0], "");
+  }
+
+  // Clean up any remaining whitespace from removals
+  cleanedText = cleanedText.trim();
+
+  return { cleanedText, extractedTools };
+}
+
 function buildClaudeResponse(request, fullText, toolUses) {
+  // Extract any XML-formatted tool calls from the text
+  const { cleanedText, extractedTools } = extractXmlToolCalls(fullText);
+
+  // Merge extracted XML tools with toolUseEvent tools
+  const allToolUses = [...toolUses, ...extractedTools];
+
   const content = [];
-  if (fullText) {
+  if (cleanedText) {
     content.push({
       type: "text",
-      text: fullText
+      text: cleanedText
     });
   }
 
-  for (const toolUse of toolUses) {
+  for (const toolUse of allToolUses) {
     let input = toolUse.input;
     if (typeof input === "string") {
       try {
@@ -420,8 +564,8 @@ function buildClaudeResponse(request, fullText, toolUses) {
     });
   }
 
-  let outputText = fullText || "";
-  for (const tu of toolUses) {
+  let outputText = cleanedText || "";
+  for (const tu of allToolUses) {
     outputText += JSON.stringify(tu.input || {});
   }
 
@@ -431,7 +575,7 @@ function buildClaudeResponse(request, fullText, toolUses) {
     role: "assistant",
     model: request.model || "kiro",
     content,
-    stop_reason: toolUses.length > 0 ? "tool_use" : "end_turn",
+    stop_reason: allToolUses.length > 0 ? "tool_use" : "end_turn",
     stop_sequence: null,
     usage: {
       input_tokens: estimateInputTokens(request),
